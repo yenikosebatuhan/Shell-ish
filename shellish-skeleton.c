@@ -6,6 +6,8 @@
 #include <sys/wait.h>
 #include <termios.h> // termios, TCSANOW, ECHO, ICANON
 #include <unistd.h>
+#include <limits.h>
+
 const char *sysname = "shellish";
 
 enum return_codes {
@@ -305,6 +307,42 @@ int prompt(struct command_t *command) {
   tcsetattr(STDIN_FILENO, TCSANOW, &backup_termios);
   return SUCCESS;
 }
+
+static char *resolve_path(const char *cmd) { 
+
+  if  (strchr(cmd, '/') != NULL) {
+      return strdup (cmd);
+      }
+      
+  char *path_env = getenv("PATH");
+  if (path_env == NULL ) 
+    return NULL;
+
+  char *path_copy = strdup(path_env);
+  if (path_copy == NULL) 
+    return NULL;
+  
+  char *saveptr = NULL;
+  char *dir = strtok_r(path_copy, ":"; &saveptr);
+
+  char candidate[PATH_MAX];
+  
+  while (dir != NULL) {
+    snprintf(candidate, sizeof(candidate), "%s/%s", dir, cmd);
+    
+    if (access(candidate, X_OK) == 0 {
+      
+      free(path_copy);
+      return strdup(candidate);
+  }
+  
+  dir = strtok_r(NULL, ":", &saveptr);
+  }
+  
+  free(path_copy);
+  return NULL;
+  
+  }
 
 int process_command(struct command_t *command) {
   int r;
