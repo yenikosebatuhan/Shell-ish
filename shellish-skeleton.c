@@ -369,8 +369,15 @@ int process_command(struct command_t *command) {
     }
   } else {
     // TODO: implement background processes here
-    wait(0); // wait for child process to finish
+    if (command->background) {
+    
+    while (waitpid(-1, NULL, WNOHANG) > 0) {}
     return SUCCESS;
+  } else {
+    
+    waitpid(pid, NULL, 0);
+    return SUCCESS;
+  }
   }
 }
 
