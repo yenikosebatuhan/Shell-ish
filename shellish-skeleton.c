@@ -228,26 +228,18 @@ int prompt(struct command_t *command) {
   char buf[4096];
   static char oldbuf[4096];
 
-  // tcgetattr gets the parameters of the current terminal
-  // STDIN_FILENO will tell tcgetattr that it should write the settings
-  // of stdin to oldt
   static struct termios backup_termios, new_termios;
   tcgetattr(STDIN_FILENO, &backup_termios);
   new_termios = backup_termios;
-  // ICANON normally takes care that one line at a time will be processed
-  // that means it will return if it sees a "\n" or an EOF or an EOL
   new_termios.c_lflag &=
       ~(ICANON |
         ECHO); // Also disable automatic echo. We manually echo each char.
-  // Those new settings will be set to STDIN
-  // TCSANOW tells tcsetattr to change attributes immediately.
   tcsetattr(STDIN_FILENO, TCSANOW, &new_termios);
 
   show_prompt();
   buf[0] = 0;
   while (1) {
     c = getchar();
-    // printf("Keycode: %u\n", c); // DEBUG: uncomment for debugging
 
     if (c == 9) // handle tab
     {
@@ -301,48 +293,45 @@ int prompt(struct command_t *command) {
 
   parse_command(buf, command);
 
-  // print_command(command); // DEBUG: uncomment for debugging
-
-  // restore the old settings
   tcsetattr(STDIN_FILENO, TCSANOW, &backup_termios);
   return SUCCESS;
 }
 
-static char *resolve_path(const char *cmd) { 
+static char *resolve_path(const char *cmd) {
 
-  if  (strchr(cmd, '/') != NULL) {
-      return strdup (cmd);
-      }
-      
+  if (strchr(cmd, '/') != NULL) {
+    return strdup(cmd);
+  }
+
   char *path_env = getenv("PATH");
-  if (path_env == NULL ) 
+  if (path_env == NULL)
     return NULL;
 
   char *path_copy = strdup(path_env);
-  if (path_copy == NULL) 
+  if (path_copy == NULL)
     return NULL;
-  
+
   char *saveptr = NULL;
-  char *dir = strtok_r(path_copy, ":"; &saveptr);
+  char *dir = strtok_r(path_copy, ":", &saveptr);
 
   char candidate[PATH_MAX];
-  
+
   while (dir != NULL) {
     snprintf(candidate, sizeof(candidate), "%s/%s", dir, cmd);
-    
-    if (access(candidate, X_OK) == 0 {
-      
+
+    if (access(candidate, X_OK) == 0) {
+
       free(path_copy);
       return strdup(candidate);
+    }
+
+    dir = strtok_r(NULL, ":", &saveptr);
   }
-  
-  dir = strtok_r(NULL, ":", &saveptr);
-  }
-  
+
   free(path_copy);
   return NULL;
-  
-  }
+
+}
 
 int process_command(struct command_t *command) {
   int r;
@@ -364,19 +353,20 @@ int process_command(struct command_t *command) {
   pid_t pid = fork();
   if (pid == 0) // child
   {
-    /// This shows how to do exec with environ (but is not available on MacOs)
-    // extern char** environ; // environment variables
-    // execvpe(command->name, command->args, environ); // exec+args+path+environ
-
-    /// This shows how to do exec with auto-path resolve
-    // add a NULL argument to the end of args, and the name to the beginning
-    // as required by exec
-
     // TODO: do your own exec with path resolving using execv()
     // do so by replacing the execvp call below
-    execvp(command->name, command->args); // exec+args+path
-    printf("-%s: %s: command not found\n", sysname, command->name);
-    exit(127);
+    char *full_path = resolve_path(command->name);
+
+    if (full_path != NULL) {
+      execv(full_path, command->args);
+      fprintf(stderr, "-%s: %s: %s\n", sysname, command->name, strerror(errno));
+      free(full_path);
+      exit(126);
+    } else {
+      // resolve_path returned NULL
+      fprintf(stderr, "-%s: %s: command not found\n", sysname, command->name);
+      exit(127); // 127 is standard for "Command not found"
+    }
   } else {
     // TODO: implement background processes here
     wait(0); // wait for child process to finish
