@@ -7,6 +7,7 @@
 #include <termios.h> // termios, TCSANOW, ECHO, ICANON
 #include <unistd.h>
 #include <limits.h>
+#include <fcntl.h>
 
 const char *sysname = "shellish";
 
@@ -333,6 +334,123 @@ static char *resolve_path(const char *cmd) {
 
 }
 
+static void apply_redirects(struct command_t *command) {
+  if (command->redirects[0] != NULL) {
+    int fd_in = open(command->redirects[0], O_RDONLY);
+    if (fd_in < 0) {
+      fprintf(stderr, "-%s: %s: %s\n", sysname, command->redirects[0], strerror(errno));
+      exit(1);
+    }
+    if (dup2(fd_in, STDIN_FILENO) < 0) {
+      fprintf(stderr, "-%s: %s\n", sysname, strerror(errno));
+      close(fd_in);
+      exit(1);
+    }
+    close(fd_in);
+  }
+
+  if (command->redirects[2] != NULL) {
+    int fd_out = open(command->redirects[2], O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd_out < 0) {
+      fprintf(stderr, "-%s: %s: %s\n", sysname, command->redirects[2], strerror(errno));
+      exit(1);
+    }
+    if (dup2(fd_out, STDOUT_FILENO) < 0) {
+      fprintf(stderr, "-%s: %s\n", sysname, strerror(errno));
+      close(fd_out);
+      exit(1);
+    }
+    close(fd_out);
+  } else if (command->redirects[1] != NULL) {
+    int fd_out = open(command->redirects[1], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd_out < 0) {
+      fprintf(stderr, "-%s: %s: %s\n", sysname, command->redirects[1], strerror(errno));
+      exit(1);
+    }
+    if (dup2(fd_out, STDOUT_FILENO) < 0) {
+      fprintf(stderr, "-%s: %s\n", sysname, strerror(errno));
+      close(fd_out);
+      exit(1);
+    }
+    close(fd_out);
+  }
+}
+
+static int run_pipeline(struct command_t *command) {
+  int prev_read = -1;
+  pid_t pids[256];
+  int pid_count = 0;
+
+  struct command_t *cur = command;
+
+  while (cur != NULL) {
+    int pipefd[2] = {-1, -1};
+    if (cur->next != NULL) {
+      if (pipe(pipefd) < 0) {
+        fprintf(stderr, "-%s: %s\n", sysname, strerror(errno));
+        return SUCCESS;
+      }
+    }
+
+    pid_t pid = fork();
+    if (pid == 0) {
+      if (prev_read != -1) {
+        dup2(prev_read, STDIN_FILENO);
+      }
+      if (cur->next != NULL) {
+        dup2(pipefd[1], STDOUT_FILENO);
+      }
+
+      if (prev_read != -1) close(prev_read);
+      if (pipefd[0] != -1) close(pipefd[0]);
+      if (pipefd[1] != -1) close(pipefd[1]);
+
+      apply_redirects(cur);
+
+      char *full_path = resolve_path(cur->name);
+      if (full_path != NULL) {
+        execv(full_path, cur->args);
+        fprintf(stderr, "-%s: %s: %s\n", sysname, cur->name, strerror(errno));
+        free(full_path);
+        exit(126);
+      } else {
+        fprintf(stderr, "-%s: %s: command not found\n", sysname, cur->name);
+        exit(127);
+      }
+    }
+
+    if (pid < 0) {
+      fprintf(stderr, "-%s: %s\n", sysname, strerror(errno));
+      if (prev_read != -1) close(prev_read);
+      if (pipefd[0] != -1) close(pipefd[0]);
+      if (pipefd[1] != -1) close(pipefd[1]);
+      return SUCCESS;
+    }
+
+    if (pid_count < 256) {
+      pids[pid_count++] = pid;
+    }
+
+    if (prev_read != -1) close(prev_read);
+    if (pipefd[1] != -1) close(pipefd[1]);
+    prev_read = pipefd[0];
+
+    cur = cur->next;
+  }
+
+  if (prev_read != -1) close(prev_read);
+
+  if (command->background) {
+    while (waitpid(-1, NULL, WNOHANG) > 0) {}
+    return SUCCESS;
+  } else {
+    for (int i = 0; i < pid_count; i++) {
+      waitpid(pids[i], NULL, 0);
+    }
+    return SUCCESS;
+  }
+}
+
 int process_command(struct command_t *command) {
   int r;
   if (strcmp(command->name, "") == 0)
@@ -350,11 +468,17 @@ int process_command(struct command_t *command) {
     }
   }
 
+  if (command->next != NULL) {
+    return run_pipeline(command);
+  }
+
   pid_t pid = fork();
   if (pid == 0) // child
   {
     // TODO: do your own exec with path resolving using execv()
     // do so by replacing the execvp call below
+    apply_redirects(command);
+
     char *full_path = resolve_path(command->name);
 
     if (full_path != NULL) {
@@ -370,14 +494,14 @@ int process_command(struct command_t *command) {
   } else {
     // TODO: implement background processes here
     if (command->background) {
-    
-    while (waitpid(-1, NULL, WNOHANG) > 0) {}
-    return SUCCESS;
-  } else {
-    
-    waitpid(pid, NULL, 0);
-    return SUCCESS;
-  }
+
+      while (waitpid(-1, NULL, WNOHANG) > 0) {}
+      return SUCCESS;
+    } else {
+
+      waitpid(pid, NULL, 0);
+      return SUCCESS;
+    }
   }
 }
 
