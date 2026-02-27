@@ -8,6 +8,9 @@
 #include <unistd.h>
 #include <limits.h>
 #include <fcntl.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <signal.h>
 
 const char *sysname = "shellish";
 
@@ -386,35 +389,212 @@ static int parse_positive_int(const char *s) {
   return x;
 }
 
+static int builtin_pinfo(struct command_t *command) {
+  if (command->args[1] == NULL) {
+    fprintf(stderr, "-%s: pinfo: missing pid\n", sysname);
+    return SUCCESS;
+  }
+
+  int pid = parse_positive_int(command->args[1]);
+  if (pid <= 0) {
+    fprintf(stderr, "-%s: pinfo: invalid pid\n", sysname);
+    return SUCCESS;
+  }
+
+  char path[PATH_MAX];
+  snprintf(path, sizeof(path), "/proc/%d/status", pid);
+
+  FILE *f = fopen(path, "r");
+  if (!f) {
+    fprintf(stderr, "-%s: pinfo: %s\n", sysname, strerror(errno));
+    return SUCCESS;
+  }
+
+  char line[512];
+  int shown = 0;
+  while (fgets(line, sizeof(line), f) != NULL) {
+    if (strncmp(line, "Name:", 5) == 0 ||
+        strncmp(line, "State:", 6) == 0 ||
+        strncmp(line, "PPid:", 5) == 0 ||
+        strncmp(line, "VmSize:", 7) == 0 ||
+        strncmp(line, "VmRSS:", 6) == 0) {
+      fputs(line, stdout);
+      shown++;
+    }
+    if (shown >= 5) break;
+  }
+  fclose(f);
+  return SUCCESS;
+}
+
+static int ensure_dir_exists(const char *dir) {
+  struct stat st;
+  if (stat(dir, &st) == 0) {
+    if (S_ISDIR(st.st_mode)) return 0;
+    return -1;
+  }
+  if (mkdir(dir, 0777) == 0) return 0;
+  return -1;
+}
+
+static int ensure_fifo_exists(const char *path) {
+  struct stat st;
+  if (stat(path, &st) == 0) {
+    if (S_ISFIFO(st.st_mode)) return 0;
+    return -1;
+  }
+  if (mkfifo(path, 0666) == 0) return 0;
+  if (errno == EEXIST) return 0;
+  return -1;
+}
+
+static void chatroom_reader_loop(const char *fifo_path) {
+  int fd = open(fifo_path, O_RDONLY | O_NONBLOCK);
+  if (fd < 0) exit(1);
+
+  char buf[1024];
+  while (1) {
+    ssize_t n = read(fd, buf, sizeof(buf));
+    if (n > 0) {
+      write(STDOUT_FILENO, buf, (size_t)n);
+    } else {
+      usleep(20000);
+    }
+  }
+}
+
+static int builtin_chatroom(struct command_t *command) {
+  if (command->args[1] == NULL || command->args[2] == NULL) {
+    fprintf(stderr, "-%s: chatroom: usage: chatroom <roomname> <username>\n", sysname);
+    return SUCCESS;
+  }
+
+  const char *room = command->args[1];
+  const char *user = command->args[2];
+
+  char roomdir[PATH_MAX];
+  snprintf(roomdir, sizeof(roomdir), "/tmp/chatroom-%s", room);
+
+  if (ensure_dir_exists(roomdir) != 0) {
+    fprintf(stderr, "-%s: chatroom: %s\n", sysname, strerror(errno));
+    return SUCCESS;
+  }
+
+  char myfifo[PATH_MAX];
+  snprintf(myfifo, sizeof(myfifo), "%s/%s", roomdir, user);
+
+  if (ensure_fifo_exists(myfifo) != 0) {
+    fprintf(stderr, "-%s: chatroom: %s\n", sysname, strerror(errno));
+    return SUCCESS;
+  }
+
+  printf("Welcome to %s!\n", room);
+
+  pid_t reader = fork();
+  if (reader == 0) {
+    chatroom_reader_loop(myfifo);
+    exit(0);
+  }
+
+  char line[512];
+  while (1) {
+    printf("[%s] %s > ", room, user);
+    fflush(stdout);
+
+    if (fgets(line, sizeof(line), stdin) == NULL) break;
+    if (strcmp(line, "/exit\n") == 0 || strcmp(line, "/exit") == 0) break;
+
+    char msg[1024];
+    int m = snprintf(msg, sizeof(msg), "[%s] %s: %s", room, user, line);
+    if (m <= 0) continue;
+
+    DIR *d = opendir(roomdir);
+    if (!d) continue;
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+      if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+      if (strcmp(ent->d_name, user) == 0) continue;
+
+      char otherfifo[PATH_MAX];
+      snprintf(otherfifo, sizeof(otherfifo), "%s/%s", roomdir, ent->d_name);
+
+      pid_t sp = fork();
+      if (sp == 0) {
+        int fd = open(otherfifo, O_WRONLY | O_NONBLOCK);
+        if (fd >= 0) {
+          write(fd, msg, (size_t)m);
+          close(fd);
+        }
+        exit(0);
+      }
+    }
+    closedir(d);
+
+    while (waitpid(-1, NULL, WNOHANG) > 0) {}
+  }
+
+  if (reader > 0) {
+    kill(reader, SIGKILL);
+    waitpid(reader, NULL, 0);
+  }
+
+  unlink(myfifo);
+  return SUCCESS;
+}
+
 static int builtin_cut(struct command_t *command) {
   char delim = '\t';
   char *fields_spec = NULL;
 
   for (int i = 1; command->args[i] != NULL; i++) {
-    if (strcmp(command->args[i], "-d") == 0) {
+    char *a = command->args[i];
+
+    if (strcmp(a, "-d") == 0) {
       if (command->args[i + 1] != NULL && command->args[i + 1][0] != '\0') {
         delim = command->args[i + 1][0];
         i++;
       }
       continue;
     }
-    if (strncmp(command->args[i], "-d", 2) == 0) {
-      if (command->args[i][2] != '\0') {
-        delim = command->args[i][2];
+    if (strncmp(a, "-d", 2) == 0) {
+      if (a[2] != '\0') delim = a[2];
+      continue;
+    }
+
+    if (strcmp(a, "--delimiter") == 0) {
+      if (command->args[i + 1] != NULL && command->args[i + 1][0] != '\0') {
+        delim = command->args[i + 1][0];
+        i++;
       }
       continue;
     }
-    if (strcmp(command->args[i], "-f") == 0) {
+    if (strncmp(a, "--delimiter=", 12) == 0) {
+      if (a[12] != '\0') delim = a[12];
+      continue;
+    }
+
+    if (strcmp(a, "-f") == 0) {
       if (command->args[i + 1] != NULL) {
         fields_spec = command->args[i + 1];
         i++;
       }
       continue;
     }
-    if (strncmp(command->args[i], "-f", 2) == 0) {
-      if (command->args[i][2] != '\0') {
-        fields_spec = command->args[i] + 2;
+    if (strncmp(a, "-f", 2) == 0) {
+      if (a[2] != '\0') fields_spec = a + 2;
+      continue;
+    }
+
+    if (strcmp(a, "--fields") == 0) {
+      if (command->args[i + 1] != NULL) {
+        fields_spec = command->args[i + 1];
+        i++;
       }
+      continue;
+    }
+    if (strncmp(a, "--fields=", 9) == 0) {
+      if (a[9] != '\0') fields_spec = a + 9;
       continue;
     }
   }
@@ -530,6 +710,14 @@ static int run_pipeline(struct command_t *command) {
         builtin_cut(cur);
         exit(0);
       }
+      if (strcmp(cur->name, "pinfo") == 0) {
+        builtin_pinfo(cur);
+        exit(0);
+      }
+      if (strcmp(cur->name, "chatroom") == 0) {
+        fprintf(stderr, "-%s: chatroom cannot be used in a pipe\n", sysname);
+        exit(1);
+      }
 
       char *full_path = resolve_path(cur->name);
       if (full_path != NULL) {
@@ -605,6 +793,16 @@ int process_command(struct command_t *command) {
 
     if (strcmp(command->name, "cut") == 0) {
       builtin_cut(command);
+      exit(0);
+    }
+
+    if (strcmp(command->name, "pinfo") == 0) {
+      builtin_pinfo(command);
+      exit(0);
+    }
+
+    if (strcmp(command->name, "chatroom") == 0) {
+      builtin_chatroom(command);
       exit(0);
     }
 
