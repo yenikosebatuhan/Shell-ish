@@ -376,6 +376,125 @@ static void apply_redirects(struct command_t *command) {
   }
 }
 
+static int parse_positive_int(const char *s) {
+  if (s == NULL || *s == '\0') return -1;
+  int x = 0;
+  for (int i = 0; s[i] != '\0'; i++) {
+    if (s[i] < '0' || s[i] > '9') return -1;
+    x = x * 10 + (s[i] - '0');
+  }
+  return x;
+}
+
+static int builtin_cut(struct command_t *command) {
+  char delim = '\t';
+  char *fields_spec = NULL;
+
+  for (int i = 1; command->args[i] != NULL; i++) {
+    if (strcmp(command->args[i], "-d") == 0) {
+      if (command->args[i + 1] != NULL && command->args[i + 1][0] != '\0') {
+        delim = command->args[i + 1][0];
+        i++;
+      }
+      continue;
+    }
+    if (strncmp(command->args[i], "-d", 2) == 0) {
+      if (command->args[i][2] != '\0') {
+        delim = command->args[i][2];
+      }
+      continue;
+    }
+    if (strcmp(command->args[i], "-f") == 0) {
+      if (command->args[i + 1] != NULL) {
+        fields_spec = command->args[i + 1];
+        i++;
+      }
+      continue;
+    }
+    if (strncmp(command->args[i], "-f", 2) == 0) {
+      if (command->args[i][2] != '\0') {
+        fields_spec = command->args[i] + 2;
+      }
+      continue;
+    }
+  }
+
+  if (fields_spec == NULL || fields_spec[0] == '\0') {
+    return SUCCESS;
+  }
+
+  int fields[256];
+  int fields_n = 0;
+
+  char *spec_copy = strdup(fields_spec);
+  if (spec_copy == NULL) return SUCCESS;
+
+  char *saveptr = NULL;
+  char *tok = strtok_r(spec_copy, ",", &saveptr);
+  while (tok != NULL && fields_n < 256) {
+    int v = parse_positive_int(tok);
+    if (v > 0) fields[fields_n++] = v;
+    tok = strtok_r(NULL, ",", &saveptr);
+  }
+
+  free(spec_copy);
+
+  if (fields_n == 0) {
+    return SUCCESS;
+  }
+
+  char *line = NULL;
+  size_t cap = 0;
+
+  while (1) {
+    ssize_t nread = getline(&line, &cap, stdin);
+    if (nread < 0) break;
+
+    int has_nl = 0;
+    if (nread > 0 && line[nread - 1] == '\n') {
+      has_nl = 1;
+      line[nread - 1] = '\0';
+      nread--;
+    }
+
+    char *starts[1024];
+    char *ends[1024];
+    int count = 0;
+
+    char *p = line;
+    starts[count] = p;
+
+    while (*p != '\0') {
+      if (*p == delim) {
+        ends[count] = p;
+        *p = '\0';
+        count++;
+        if (count >= 1023) break;
+        starts[count] = p + 1;
+      }
+      p++;
+    }
+
+    ends[count] = p;
+    count++;
+
+    int first_out = 1;
+    for (int i = 0; i < fields_n; i++) {
+      int idx = fields[i] - 1;
+      if (idx >= 0 && idx < count) {
+        if (!first_out) putchar(delim);
+        fputs(starts[idx], stdout);
+        first_out = 0;
+      }
+    }
+
+    if (has_nl) putchar('\n');
+  }
+
+  if (line) free(line);
+  return SUCCESS;
+}
+
 static int run_pipeline(struct command_t *command) {
   int prev_read = -1;
   pid_t pids[256];
@@ -406,6 +525,11 @@ static int run_pipeline(struct command_t *command) {
       if (pipefd[1] != -1) close(pipefd[1]);
 
       apply_redirects(cur);
+
+      if (strcmp(cur->name, "cut") == 0) {
+        builtin_cut(cur);
+        exit(0);
+      }
 
       char *full_path = resolve_path(cur->name);
       if (full_path != NULL) {
@@ -478,6 +602,11 @@ int process_command(struct command_t *command) {
     // TODO: do your own exec with path resolving using execv()
     // do so by replacing the execvp call below
     apply_redirects(command);
+
+    if (strcmp(command->name, "cut") == 0) {
+      builtin_cut(command);
+      exit(0);
+    }
 
     char *full_path = resolve_path(command->name);
 
